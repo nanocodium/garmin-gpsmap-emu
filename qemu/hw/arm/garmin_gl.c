@@ -38,12 +38,67 @@
 #include "target/arm/cpu.h"
 #include "garmin_gl.h"
 
-#ifdef CONFIG_OPENGL
+/*
+ * Host rendering needs libepoxy, which QEMU announces as CONFIG_OPENGL when
+ * it was configured with --enable-opengl.  Renderer and QEMU's own GL display
+ * paths are independent here (this file never touches the UI), so a tree
+ * where CONFIG_OPENGL cannot be enabled can still build the renderer by
+ * linking epoxy for this file and configuring
+ * --extra-cflags=-DCONFIG_GARMIN_GL_EPOXY.
+ */
+#if defined(CONFIG_OPENGL) || defined(CONFIG_GARMIN_GL_EPOXY)
+#define GARMIN_GL_HOST_RENDER 1
+#endif
+
+#ifdef GARMIN_GL_HOST_RENDER
 #include <epoxy/gl.h>
+#ifdef _WIN32
+#include <epoxy/wgl.h>
+#else
 #include <epoxy/egl.h>
+#endif
 #endif
 
 bool garmin_gl_log;                   /* GARMIN_GL_LOG=1: log every call */
+
+/*
+ * GARMIN_GL_FBO=1 enables the GL_OES_framebuffer_object and EGL surface
+ * entry points (the ops marked opt_in below).  Off by default, because
+ * implementing them is a regression as things stand: the GUI does not need
+ * them - its compositor software-renders its layers into buffers in guest
+ * memory, which the renderer picks up at swap time - and with them the page
+ * header comes out as uninitialised texture content instead of the bitmap.
+ * Left in and switchable because the driver does call them, so whatever
+ * they are for is worth finding out.
+ */
+static bool garmin_gl_fbo;
+
+/* GARMIN_GL_DRAWTEX=1: trace glDrawTexOES blits and crop-rectangle sets. */
+static bool garmin_gl_drawtex_log;
+
+/*
+ * GARMIN_GL_RESYNC=1 re-reads a texture's guest buffer at swap time even for
+ * textures the firmware did not upload in this frame, re-uploading it when
+ * the bytes there have changed.
+ *
+ * Off by default, because it is a guess about memory the firmware owns and
+ * the guess is wrong after the GUI tears its windows down and rebuilds them
+ * (switching the unit into Store Demonstration does exactly that): the
+ * layer's buffer has been freed and reused by then, so what gets uploaded is
+ * unrelated memory, and the page background fills with bands of noise.
+ *
+ * The case this was meant to cover - the compositor drawing into a layer
+ * after the GL calls that reference it - is handled without guessing by the
+ * pass over this frame's own queued uploads in sync_large_textures(), which
+ * is always active.
+ */
+static bool garmin_gl_resync;
+
+/*
+ * Base of the synthetic EGLSurface handles handed back to the firmware: any
+ * non-NULL value it will only ever pass back to us.
+ */
+#define EGL_FAKE_SURFACE  0x5eeb0000u
 
 /* ------------------------------------------------------------------ */
 /* operation table                                                       */
@@ -82,12 +137,21 @@ enum GlOp {
     OP_GETCLIPPLANEF, OP_GETBUFFERPARAM, OP_GETPOINTERV,
     OP_COPYTEXIMAGE2D, OP_COPYTEXSUBIMAGE2D,
     OP_DRAWTEX, OP_SWAPBUFFERS, OP_NOP, OP_EGL_TRUE,
+    /* GL_OES_framebuffer_object: the GUI compositor renders into textures */
+    OP_BINDFRAMEBUFFER, OP_BINDRENDERBUFFER, OP_GENFRAMEBUFFERS,
+    OP_GENRENDERBUFFERS, OP_DELETEFRAMEBUFFERS, OP_DELETERENDERBUFFERS,
+    OP_RENDERBUFFERSTORAGE, OP_FRAMEBUFFERRENDERBUFFER,
+    OP_FRAMEBUFFERTEXTURE2D, OP_CHECKFRAMEBUFFER, OP_GENERATEMIPMAP,
+    OP_EGLIMAGE_TEX2D,
+    /* EGL surface management */
+    OP_EGL_SURFACE, OP_EGL_CURSURFACE, OP_EGL_QUERYSURFACE, OP_EGL_NO_IMAGE,
 };
 
 typedef struct GlOpDef {
     const char *name;
     enum GlOp op;
     const char *sig;    /* i=int, f=float, x=fixed->float, p=pointer */
+    bool opt_in;        /* only used when GARMIN_GL_FBO=1 (see below) */
 } GlOpDef;
 
 static const GlOpDef opdefs[] = {
@@ -245,6 +309,40 @@ static const GlOpDef opdefs[] = {
     { "eglSwapBuffers", OP_SWAPBUFFERS, "ii" },
     { "eglWaitGL", OP_EGL_TRUE, "" },
     { "eglWaitNative", OP_EGL_TRUE, "i" },
+    /*
+     * GL_OES_framebuffer_object.  Desktop GL's ARB_framebuffer_object has the
+     * same semantics, so these forward directly; the one translation needed is
+     * framebuffer 0, which means "the EGL window surface" to the firmware and
+     * is the renderer's read-back FBO here (fb_target()).
+     */
+    { "glBindFramebufferOES", OP_BINDFRAMEBUFFER, "ii" , true },
+    { "glBindRenderbufferOES", OP_BINDRENDERBUFFER, "ii" , true },
+    { "glGenFramebuffersOES", OP_GENFRAMEBUFFERS, "ip" , true },
+    { "glGenRenderbuffersOES", OP_GENRENDERBUFFERS, "ip" , true },
+    { "glDeleteFramebuffersOES", OP_DELETEFRAMEBUFFERS, "ip" , true },
+    { "glDeleteRenderbuffersOES", OP_DELETERENDERBUFFERS, "ip" , true },
+    { "glRenderbufferStorageOES", OP_RENDERBUFFERSTORAGE, "iiii" , true },
+    { "glFramebufferRenderbufferOES", OP_FRAMEBUFFERRENDERBUFFER, "iiii" , true },
+    { "glFramebufferTexture2DOES", OP_FRAMEBUFFERTEXTURE2D, "iiiii" , true },
+    { "glCheckFramebufferStatusOES", OP_CHECKFRAMEBUFFER, "i" , true },
+    { "glGenerateMipmapOES", OP_GENERATEMIPMAP, "i" , true },
+    { "glEGLImageTargetTexture2DOES", OP_EGLIMAGE_TEX2D, "ii" , true },
+    /*
+     * EGL.  One host context and one FBO serve every surface the driver
+     * makes, so surfaces are synthetic handles and making one current is a
+     * no-op that must still report success - these used to fall through to
+     * the "logged only" path, which returns 0 = EGL_FALSE and fails the
+     * driver's error checks.
+     */
+    { "eglCreatePbufferSurface", OP_EGL_SURFACE, "iip" , true },
+    { "eglCreatePixmapSurface", OP_EGL_SURFACE, "iiip" , true },
+    { "eglDestroySurface", OP_EGL_TRUE, "ii" , true },
+    { "eglQuerySurface", OP_EGL_QUERYSURFACE, "iiip" , true },
+    { "eglMakeCurrent", OP_EGL_TRUE, "iiii" , true },
+    { "eglGetCurrentSurface", OP_EGL_CURSURFACE, "i" , true },
+    { "eglSwapInterval", OP_EGL_TRUE, "ii" , true },
+    { "eglCreateImageKHR", OP_EGL_NO_IMAGE, "iiiip" , true },
+    { "eglDestroyImageKHR", OP_EGL_TRUE, "ii" , true },
     { NULL }
 };
 
@@ -253,6 +351,7 @@ typedef struct GlHook {
     uint32_t addr;
     int nargs;
     const GlOpDef *def;
+    bool disabled;      /* has an implementation, switched off */
     uint32_t calls;
 } GlHook;
 
@@ -284,6 +383,12 @@ void garmin_gl_set_scanout(uint32_t paddr)
 
 int garmin_gl_load_table(const char *path, Error **errp)
 {
+    garmin_gl_fbo = getenv("GARMIN_GL_FBO") &&
+                    getenv("GARMIN_GL_FBO")[0] == '1';
+    garmin_gl_drawtex_log = getenv("GARMIN_GL_DRAWTEX") &&
+                            getenv("GARMIN_GL_DRAWTEX")[0] == '1';
+    garmin_gl_resync = getenv("GARMIN_GL_RESYNC") &&
+                       getenv("GARMIN_GL_RESYNC")[0] == '1';
     FILE *f = fopen(path, "r");
     char line[256];
 
@@ -333,13 +438,22 @@ int garmin_gl_load_table(const char *path, Error **errp)
         h->addr = addr & ~1u;
         h->nargs = nargs;
         h->def = NULL;
+        h->disabled = false;
         for (const GlOpDef *d = opdefs; d->name; d++) {
             if (!strcmp(d->name, name)) {
+                if (d->opt_in && !garmin_gl_fbo) {
+                    h->disabled = true;         /* stays logged-only */
+                    break;
+                }
                 h->def = d;
                 break;
             }
         }
-        if (!h->def) {
+        if (h->disabled) {
+            warn_report("gl-hooks: %s is logged only "
+                        "(implemented, off by default: GARMIN_GL_FBO=1)",
+                        name);
+        } else if (!h->def) {
             warn_report("gl-hooks: %s is logged only (no host implementation)",
                         name);
         }
@@ -508,7 +622,44 @@ typedef struct TexSrc {
 } TexSrc;
 
 static GHashTable *texsrcs;       /* texture id -> TexSrc */
+/*
+ * GL_TEXTURE_CROP_RECT_OES per texture.  Desktop GL has no such texture
+ * parameter, so forwarding it only produced GL_INVALID_ENUM and the
+ * rectangle was lost; glDrawTexOES then stretched the whole texture over
+ * the target rectangle, which is why the screen-aligned chrome strips (page
+ * header, softkey bar) came out as unrelated texels while everything drawn
+ * with ordinary quads was correct.  Kept here and applied in OP_DRAWTEX.
+ */
+static GHashTable *crops;         /* texture id -> int32_t[4] */
+/*
+ * Textures that have been attached to a framebuffer.  Their content is
+ * produced by the GPU, so the swap-time re-read below must leave them alone:
+ * guest memory holds nothing for them, and re-uploading it blanked every
+ * bitmap layer (text survived because glyph textures are copied at call
+ * time) - the GUI flickered between complete and text-only frames.
+ */
+static GHashTable *gpu_textures;
+/*
+ * The texture the per-texture state below is recorded against.  Strictly a
+ * binding is per texture unit, but tracking it that way made the GUI worse,
+ * not better: the compositor uploads its layers with an active unit we have
+ * seen no glBindTexture for, so the per-unit binding reads back as 0 and the
+ * layer stops being re-read from guest memory (wide bands of stale texels
+ * across the page background).  "Last glBindTexture" matches what this
+ * driver actually does.
+ */
+static int server_tex_unit;             /* GL_ACTIVE_TEXTURE, for logging */
 static uint32_t bound_texture;
+
+/* The crop rectangle of a texture; all zero when it never set one. */
+static const int32_t *crop_of(uint32_t tex)
+{
+    static const int32_t none[4];
+    const int32_t *c = tex ? g_hash_table_lookup(crops,
+                                                 GUINT_TO_POINTER(tex)) : NULL;
+
+    return c ? c : none;
+}
 
 static uint64_t hash_bytes(const uint8_t *p, size_t len)
 {
@@ -586,14 +737,86 @@ static void *req_out(GlReq *r, size_t len)
 /* render thread                                                          */
 /* ------------------------------------------------------------------ */
 
-#ifdef CONFIG_OPENGL
+#ifdef GARMIN_GL_HOST_RENDER
+
+static GLuint fbo, fbo_color, fbo_depth;
+
+/*
+ * The renderer needs a current desktop-GL *compatibility* context (the
+ * GLES1 fixed-function pipeline is forwarded 1:1) with framebuffer objects,
+ * but no window: everything is drawn into an FBO and read back.  How that
+ * context is obtained is the only host-specific part of this file.
+ */
+#ifdef _WIN32
+
+/*
+ * WGL: Windows has no surfaceless context, so create a hidden window and
+ * make its DC current.  A legacy wglCreateContext context is a full
+ * compatibility context (GL 4.6 on the stock AMD/NVIDIA/Intel drivers),
+ * which is exactly what is needed; dropping Mesa's opengl32.dll next to
+ * the binary gives a software (llvmpipe) fallback.
+ */
+static HWND   wgl_wnd;
+static HDC    wgl_dc;
+static HGLRC  wgl_ctx;
+
+static bool render_ctx_init(void)
+{
+    static const PIXELFORMATDESCRIPTOR pfd = {
+        .nSize = sizeof(PIXELFORMATDESCRIPTOR),
+        .nVersion = 1,
+        .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL,
+        .iPixelType = PFD_TYPE_RGBA,
+        .cColorBits = 32,
+        .cDepthBits = 24,
+        .cStencilBits = 8,
+        .iLayerType = PFD_MAIN_PLANE,
+    };
+    WNDCLASSEXA wc = {
+        .cbSize = sizeof(WNDCLASSEXA),
+        .lpfnWndProc = DefWindowProcA,
+        .hInstance = GetModuleHandle(NULL),
+        .lpszClassName = "garmin_gl_hidden",
+    };
+    int fmt;
+
+    if (!RegisterClassExA(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        error_report("garmin_gl: RegisterClass failed (%lu)",
+                     (unsigned long)GetLastError());
+        return false;
+    }
+    wgl_wnd = CreateWindowExA(0, wc.lpszClassName, "garmin_gl",
+                              WS_OVERLAPPEDWINDOW, 0, 0, 16, 16,
+                              NULL, NULL, wc.hInstance, NULL);
+    if (!wgl_wnd) {
+        error_report("garmin_gl: CreateWindow failed (%lu)",
+                     (unsigned long)GetLastError());
+        return false;
+    }
+    wgl_dc = GetDC(wgl_wnd);
+    fmt = wgl_dc ? ChoosePixelFormat(wgl_dc, &pfd) : 0;
+    if (!fmt || !SetPixelFormat(wgl_dc, fmt, &pfd)) {
+        error_report("garmin_gl: no usable pixel format (%lu)",
+                     (unsigned long)GetLastError());
+        return false;
+    }
+    wgl_ctx = wglCreateContext(wgl_dc);
+    if (!wgl_ctx || !wglMakeCurrent(wgl_dc, wgl_ctx)) {
+        error_report("garmin_gl: cannot create/make current GL context (%lu)",
+                     (unsigned long)GetLastError());
+        return false;
+    }
+    return true;
+}
+
+#else /* !_WIN32 */
 
 static EGLDisplay egl_dpy;
 static EGLContext egl_ctx;
 static EGLSurface egl_surf;
-static GLuint fbo, fbo_color, fbo_depth;
 
-static bool render_init(void)
+static bool render_ctx_init(void)
 {
     EGLint major, minor, n;
     EGLConfig cfg;
@@ -634,8 +857,22 @@ static bool render_init(void)
                      eglGetError());
         return false;
     }
+    return true;
+}
+
+#endif /* !_WIN32 */
+
+static bool render_init(void)
+{
+    if (!render_ctx_init()) {
+        return false;
+    }
     qemu_log("garmin_gl: host GL %s / %s / %s\n", glGetString(GL_VENDOR),
              glGetString(GL_RENDERER), glGetString(GL_VERSION));
+    if (!epoxy_is_desktop_gl() || epoxy_gl_version() < 20) {
+        error_report("garmin_gl: need desktop OpenGL 2.0 or later");
+        return false;
+    }
 
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -657,6 +894,26 @@ static bool render_init(void)
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     return true;
+}
+
+/*
+ * Framebuffer 0 is the window surface for the firmware; for us it is the FBO
+ * whose pixels eglSwapBuffers reads back into the DISPC scan-out buffer.
+ * Host FBO names are handed to the guest unchanged, and the host allocator
+ * already knows about `fbo`, so no other name can collide with it.
+ */
+static GLuint fb_target(GLuint fb)
+{
+    return fb ? fb : fbo;
+}
+
+/* The one GLES renderbuffer format desktop GL spells differently */
+static GLenum rb_format(GLenum fmt)
+{
+    if (fmt == 0x8d62) {                          /* GL_RGB565_OES */
+        return epoxy_gl_version() >= 41 ? GL_RGB565 : GL_RGB5;
+    }
+    return fmt;              /* RGBA4, RGB5_A1, DEPTH_COMPONENT16, STENCIL8 */
 }
 
 #define I(n)  ((GLint)r->a[n])
@@ -839,12 +1096,42 @@ static void render_exec(GlReq *r)
         break;
     }
     case OP_DRAWTEX: {
-        /* GL_OES_draw_texture: screen-aligned textured quad at (x,y,z)
-         * of size (w,h) using the texture crop rect (whole texture). */
-        GLint vp[4];
+        /*
+         * GL_OES_draw_texture: a screen-aligned quad at (x,y,z) of size
+         * (w,h) showing the part of the bound texture that its crop
+         * rectangle (Ucr,Vcr,Wcr,Hcr) selects, per the extension:
+         *     s = (Ucr + Wcr * (xs - x) / w) / tw
+         *     t = (Vcr + Hcr * (ys - y) / h) / th
+         * A zero rectangle means the firmware never set one; fall back to
+         * the whole texture, which is what this used to always do.
+         */
+        GLint vp[4], tw = 0, th = 0;
         float x = F(0), y = F(1), z = F(2), w = F(3), h = F(4);
+        float cu = F(5), cv = F(6), cw = F(7), ch = F(8);
+        float s0, t0, s1, t1;
         float v[8] = { x, y, x + w, y, x + w, y + h, x, y + h };
-        float t[8] = { 0, 0, 1, 0, 1, 1, 0, 1 };
+        float t[8];
+
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+        if (tw <= 0 || th <= 0) {
+            tw = th = 1;
+        }
+        if (cw == 0 && ch == 0) {
+            cu = 0; cv = 0; cw = tw; ch = th;
+        }
+        s0 = cu / tw; t0 = cv / th;
+        s1 = (cu + cw) / tw; t1 = (cv + ch) / th;
+        if (garmin_gl_drawtex_log) {
+            qemu_log("garmin_gl: drawtex tex=%u unit=%u dest=%g,%g %gx%g "
+                     "crop=%g,%g %gx%g texsize=%dx%d st=%g,%g..%g,%g\n",
+                     (unsigned)r->a[9], (unsigned)r->a[10], x, y, w, h,
+                     cu, cv, cw, ch, tw, th, s0, t0, s1, t1);
+        }
+        t[0] = s0; t[1] = t0;
+        t[2] = s1; t[3] = t0;
+        t[4] = s1; t[5] = t1;
+        t[6] = s0; t[7] = t1;
 
         glGetIntegerv(GL_VIEWPORT, vp);
         glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
@@ -861,13 +1148,78 @@ static void render_exec(GlReq *r)
         glMatrixMode(GL_MODELVIEW);
         break;
     }
-    case OP_SWAPBUFFERS:
+    /* ---- GL_OES_framebuffer_object ---- */
+    case OP_BINDFRAMEBUFFER:
+        glBindFramebuffer(GL_FRAMEBUFFER, fb_target(U(1)));
+        break;
+    case OP_BINDRENDERBUFFER:
+        glBindRenderbuffer(GL_RENDERBUFFER, U(1));
+        break;
+    case OP_RENDERBUFFERSTORAGE:
+        glRenderbufferStorage(GL_RENDERBUFFER, rb_format(U(1)), I(2), I(3));
+        break;
+    case OP_FRAMEBUFFERRENDERBUFFER:
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, U(1), GL_RENDERBUFFER, U(3));
+        break;
+    case OP_FRAMEBUFFERTEXTURE2D:
+        glFramebufferTexture2D(GL_FRAMEBUFFER, U(1), U(2), U(3), I(4));
+        break;
+    case OP_GENERATEMIPMAP:
+        glGenerateMipmap(U(0));
+        break;
+    case OP_GENFRAMEBUFFERS:
+        glGenFramebuffers(I(0), (GLuint *)r->out);
+        break;
+    case OP_GENRENDERBUFFERS:
+        glGenRenderbuffers(I(0), (GLuint *)r->out);
+        break;
+    case OP_DELETEFRAMEBUFFERS: {
+        GLint bound = 0;
+
+        glDeleteFramebuffers(I(0), (const GLuint *)r->in);
+        /*
+         * Deleting the bound framebuffer rebinds 0, which here is the hidden
+         * window/pbuffer rather than the buffer that gets presented, so
+         * everything drawn afterwards would vanish.
+         */
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+        if (bound == 0) {
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        }
+        break;
+    }
+    case OP_DELETERENDERBUFFERS:
+        glDeleteRenderbuffers(I(0), (const GLuint *)r->in);
+        break;
+    case OP_CHECKFRAMEBUFFER:
+        r->result = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        return;
+    case OP_EGLIMAGE_TEX2D:
+        /*
+         * An EGLImage wraps a native buffer whose layout we do not know.
+         * eglCreateImageKHR therefore reports EGL_NO_IMAGE_KHR so the driver
+         * uploads texels instead (a path the renderer implements), and this
+         * call should not be reachable.
+         */
+        warn_report_once("garmin_gl: glEGLImageTargetTexture2DOES ignored "
+                         "(no host EGLImage)");
+        break;
+    case OP_SWAPBUFFERS: {
+        GLint bound = 0;
+
+        /* Present the window surface, whatever the firmware left bound. */
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glFinish();
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(0, 0, gl_width, gl_height, GL_RGBA, GL_UNSIGNED_BYTE,
                      r->out);
+        if (bound > 0 && (GLuint)bound != fbo) {
+            glBindFramebuffer(GL_FRAMEBUFFER, bound);
+        }
         r->result = 1;
         return;
+    }
     default:
         return;
     }
@@ -894,7 +1246,7 @@ static void *render_thread(void *arg)
     return NULL;
 }
 
-#else /* !CONFIG_OPENGL */
+#else /* !GARMIN_GL_HOST_RENDER */
 
 static void *render_thread(void *arg)
 {
@@ -978,6 +1330,8 @@ static bool op_is_query(enum GlOp op)
     case OP_GETBOOLEANV: case OP_GETFIXEDV: case OP_GETLIGHTFV:
     case OP_GETMATERIALFV: case OP_GETTEXENVFV: case OP_GETTEXPARAMFV:
     case OP_GETCLIPPLANEF: case OP_FINISH: case OP_FLUSH:
+    case OP_GENFRAMEBUFFERS: case OP_GENRENDERBUFFERS:
+    case OP_CHECKFRAMEBUFFER:
         return true;
     default:
         return false;
@@ -997,6 +1351,8 @@ static void render_start(void)
     qemu_cond_init(&rcond_done);
     buffers = g_hash_table_new(NULL, NULL);
     texsrcs = g_hash_table_new_full(NULL, NULL, NULL, g_free);
+    crops = g_hash_table_new_full(NULL, NULL, NULL, g_free);
+    gpu_textures = g_hash_table_new(NULL, NULL);
     garmin_gl_log = getenv("GARMIN_GL_LOG") && getenv("GARMIN_GL_LOG")[0] == '1';
     qemu_mutex_lock(&rlock);
     qemu_thread_create(&rthread, "garmin-gl", render_thread, NULL,
@@ -1464,7 +1820,7 @@ static void sync_large_textures(CPUState *cs)
             continue;
         }
         t = g_hash_table_lookup(texsrcs, GUINT_TO_POINTER(e->a[10]));
-        if (!t || !t->dirty_check) {
+        if (!t || !t->dirty_check || g_hash_table_contains(gpu_textures, GUINT_TO_POINTER(e->a[10]))) {
             continue;
         }
         guest_read(cs, e->a[8], e->in, e->in_len);
@@ -1478,7 +1834,8 @@ static void sync_large_textures(CPUState *cs)
         GlReq *e;
         uint64_t h;
 
-        if (!t->dirty_check) {
+        if (!t->dirty_check || !garmin_gl_resync ||
+            g_hash_table_contains(gpu_textures, GUINT_TO_POINTER(id))) {
             continue;
         }
         if (t->synced_frame) {
@@ -1505,8 +1862,9 @@ static void sync_large_textures(CPUState *cs)
         g_queue_push_head(&frame_q, mk_bind_req(bound_at_swap));
         g_queue_push_head(&frame_q, e);
         g_queue_push_head(&frame_q, mk_bind_req(id));
-        if (garmin_gl_log) {
-            qemu_log("garmin_gl: texture %u re-uploaded at swap (layer changed)\n", id);
+        if (garmin_gl_log || garmin_gl_drawtex_log) {
+            qemu_log("garmin_gl: texture %u re-uploaded at swap "
+                     "(%dx%d, layer changed)\n", id, t->w, t->h);
         }
     }
 }
@@ -1628,6 +1986,9 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
         }
         goto done;
     }
+    case OP_ACTIVETEXTURE:
+        server_tex_unit = MIN(raw[0] - 0x84c0, 3u);
+        break;
     case OP_PIXELSTORE:
         if (raw[0] == 0x0cf5) {                 /* GL_UNPACK_ALIGNMENT */
             unpack_alignment = raw[1] ? raw[1] : 4;
@@ -1645,9 +2006,62 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
     case OP_EGL_TRUE:
         r->result = 1;
         goto done;
+    case OP_EGL_SURFACE: {
+        static uint32_t surfaces;
+
+        /* Synthetic handle: every surface aliases the one host FBO. */
+        r->result = EGL_FAKE_SURFACE + (++surfaces);
+        goto done;
+    }
+    case OP_EGL_CURSURFACE:
+        r->result = EGL_FAKE_SURFACE;
+        goto done;
+    case OP_EGL_QUERYSURFACE: {
+        uint32_t v;
+
+        switch (raw[2]) {
+        case 0x3057: v = gl_width; break;            /* EGL_WIDTH */
+        case 0x3056: v = gl_height; break;           /* EGL_HEIGHT */
+        case 0x3086: v = 0x3084; break;              /* RENDER_BUFFER = BACK */
+        case 0x3093: v = 0x3095; break;              /* SWAP_BEHAVIOR = DESTROYED */
+        case 0x3080: case 0x3081: v = 0x305c; break; /* TEXTURE_* = NO_TEXTURE */
+        case 0x3090: case 0x3091: case 0x3092:       /* resolution / aspect */
+            v = 0xffffffff; break;                   /* EGL_UNKNOWN */
+        default: v = 0; break;
+        }
+        guest_write(cs, raw[3], &v, 4);
+        r->result = 1;
+        goto done;
+    }
+    case OP_EGL_NO_IMAGE:
+        /*
+         * EGL_NO_IMAGE_KHR.  Failing here is deliberate: the driver then
+         * uploads the texture itself, which the renderer supports, instead of
+         * relying on a zero-copy native buffer it cannot share with us.
+         */
+        r->result = 0;
+        goto done;
 
     /* ---- calls needing guest data ---- */
     case OP_LIGHTFV: case OP_MATERIALFV: case OP_TEXENVFV: case OP_TEXPARAMFV:
+        if (d->op == OP_TEXPARAMFV && raw[1] == 0x8b9d && bound_texture) {
+            uint32_t words[4] = { 0 };
+            int32_t *c = g_new0(int32_t, 4);
+            bool fixed = d->sig[2] == 'P';
+
+            guest_read(cs, raw[2], words, sizeof(words));
+            for (int i = 0; i < 4; i++) {
+                /* glTexParameterxv passes 16.16 fixed point */
+                c[i] = fixed ? (int32_t)fx2f(words[i]) : (int32_t)words[i];
+            }
+            if (garmin_gl_drawtex_log) {
+                qemu_log("garmin_gl: crop set tex=%u unit=%d rect=%d,%d %dx%d\n",
+                         bound_texture, server_tex_unit,
+                         c[0], c[1], c[2], c[3]);
+            }
+            g_hash_table_insert(crops, GUINT_TO_POINTER(bound_texture), c);
+            goto done;
+        }
         marshal_vec4(cs, r, raw[2], *kind_of_ptr(d, 2));
         break;
     case OP_LIGHTMODELFV: case OP_FOGFV: case OP_POINTPARAMFV: case OP_CLIPPLANEF:
@@ -1662,9 +2076,16 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
             goto done;
         }
         break;
-    case OP_DRAWTEX:
+    case OP_DRAWTEX: {
+        const int32_t *c = crop_of(bound_texture);
 
+        for (int i = 0; i < 4; i++) {
+            r->a[5 + i] = f2bits((float)c[i]);
+        }
+        r->a[9] = bound_texture;
+        r->a[10] = server_tex_unit;
         break;
+    }
     case OP_DRAWELEMENTS: {
         int count = raw[1], type = raw[2];
 
@@ -1718,9 +2139,11 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
                 t->ptr = raw[8]; t->w = raw[3]; t->h = raw[4];
                 t->fmt = raw[6]; t->type = raw[7]; t->len = len;
                 t->hash = hash_bytes(r->in, len & ~3u);
-                /* only large surfaces are drawn into after the call */
+                /* only large surfaces are drawn into after the call, and
+                 * never ones the GPU renders into itself */
                 t->dirty_check = (size_t)raw[3] * raw[4] >= 256 * 256 &&
-                                 raw[6] != 0x1906;      /* never GL_ALPHA strips */
+                                 raw[6] != 0x1906 &&    /* never GL_ALPHA strips */
+                                 !g_hash_table_contains(gpu_textures, GUINT_TO_POINTER(bound_texture));
                 g_hash_table_insert(texsrcs, GUINT_TO_POINTER(bound_texture), t);
             }
         } else if (d->op == OP_TEXSUBIMAGE2D) {
@@ -1730,6 +2153,17 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
         }
         break;
     }
+    case OP_FRAMEBUFFERTEXTURE2D:
+        /* The GPU takes over this texture's content from here on. */
+        if (raw[3]) {
+            TexSrc *t = g_hash_table_lookup(texsrcs, GUINT_TO_POINTER(raw[3]));
+
+            g_hash_table_add(gpu_textures, GUINT_TO_POINTER(raw[3]));
+            if (t) {
+                t->dirty_check = false;
+            }
+        }
+        break;
     case OP_COMPRESSEDTEXIMAGE2D:
     case OP_COMPRESSEDTEXSUBIMAGE2D: {
         bool sub = d->op == OP_COMPRESSEDTEXSUBIMAGE2D;
@@ -1757,10 +2191,18 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
         req_out(r, len);
         break;
     }
-    case OP_GENTEXTURES:
+    case OP_GENTEXTURES: case OP_GENFRAMEBUFFERS: case OP_GENRENDERBUFFERS:
         req_out(r, MIN(raw[0], 256u) * 4);
         r->a[0] = MIN(raw[0], 256u);
         break;
+    case OP_DELETEFRAMEBUFFERS: case OP_DELETERENDERBUFFERS: {
+        int cnt = MIN(raw[0], 256u);
+
+        req_push(r, NULL, cnt * 4);
+        guest_read(cs, raw[1], r->in, cnt * 4);
+        r->a[0] = cnt;
+        break;
+    }
     case OP_DELETETEXTURES: {
         int cnt = MIN(raw[0], 256u);
 
@@ -1769,6 +2211,10 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
         r->a[0] = cnt;
         for (int i = 0; i < cnt; i++) {         /* forget their client sources */
             g_hash_table_remove(texsrcs,
+                                GUINT_TO_POINTER(((uint32_t *)r->in)[i]));
+            g_hash_table_remove(gpu_textures,
+                                GUINT_TO_POINTER(((uint32_t *)r->in)[i]));
+            g_hash_table_remove(crops,
                                 GUINT_TO_POINTER(((uint32_t *)r->in)[i]));
         }
         break;
@@ -1828,7 +2274,14 @@ static uint32_t gl_dispatch(CPUState *cs, GlHook *h, const uint32_t *raw)
     case OP_GENTEXTURES:
         for (uint32_t i = 0; i < r->a[0]; i++) {
             g_hash_table_remove(texsrcs, GUINT_TO_POINTER(((uint32_t *)r->out)[i]));
+            g_hash_table_remove(gpu_textures,
+                                GUINT_TO_POINTER(((uint32_t *)r->out)[i]));
+            g_hash_table_remove(crops,
+                                GUINT_TO_POINTER(((uint32_t *)r->out)[i]));
         }
+        guest_write(cs, raw[1], r->out, r->a[0] * 4);
+        break;
+    case OP_GENFRAMEBUFFERS: case OP_GENRENDERBUFFERS:
         guest_write(cs, raw[1], r->out, r->a[0] * 4);
         break;
     case OP_GETFLOATV:
