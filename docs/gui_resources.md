@@ -158,7 +158,29 @@ The removable-media scanner `0x80f3e440` loads `<card>/Garmin/resources` exactly
    mkdir -p sdroot/Garmin/resources && cd sdroot/Garmin/resources && unzip ../../../dat/116.bin
    ```
    Minimum content: `bmp_hndl.b2c` (+ the two `bmp_hndl_night_*.b2c`) and the `76xx/` directory (the `.b2c` paths are relative to the package directory; files are opened with the path from the `.b2c`, `.BMP` appended only when no extension is present). The other directories (`mdb/`, `udb/`, `mpm*/`, `acdb/`, root `H_*.bmp`) can be added later; missing files only fail on demand.
-2. Build a FAT32 image (>= 256 MB for the full package, ~90 MB for `76xx/` + b2c) with a `Garmin/resources` tree, e.g. `mformat`/`mcopy` (mtools) or `mkfs.vfat` + a loop mount in WSL, convert to qcow2 and attach it as drive index 0 (move the snapshot store to another drive, `tools/make_snapshot.sh` assumes index 0).
+### Long file names on the card: the firmware counts the entries
+
+A long name is stored 13 UTF-16 characters per directory entry, and the NUL
+terminator is only written when the name leaves room for it.  A name whose
+length is an exact multiple of 13 fills its last entry exactly and must *not*
+get a terminator: appending one adds a whole extra entry.
+
+Lenient readers (7-Zip, Linux, Windows) accept the extra entry, but the
+GPSMAP firmware expects `ceil(len / 13)` entries and cannot find such a file
+at all.  In the resource package that is **206 of the 2939 bitmaps**, and
+they are conspicuous ones - `H_UX_1024W_Page_Header.bmp` (26),
+`H_UX_1024W_Top_Bar_Background_Slice.bmp` (39),
+`H_UX_1024_Home_Icon_Sea_Temperature.bmp` (39),
+`H_UX_1024_Icon_Dynamic_Full_ClearVu.bmp` (39) - so the page header rendered
+as the stretched red/white "missing image" placeholder and several
+home-screen icons as the red X, while everything else looked fine.
+
+`tools/mkfatimg.py` had exactly this bug; the symptom is worth remembering
+because it looks like a renderer fault and is not one.  A card written by
+mtools or pyfatfs does not have it, which is what identified it: same
+package, same firmware, one card renders the header and the other does not.
+
+2. Build a FAT32 image (>= 256 MB for the full package, ~90 MB for `76xx/` + b2c) with a `Garmin/resources` tree and convert it to qcow2. `tools/mk_resource_sd.py` does the whole job on any host (`tools/mkfatimg.py` writes the FAT32 volume itself, so no mtools, no loop mount and no root); it attaches as drive index 3 = slot `sd0`. `--subset 76xx` builds the smaller card. Drive index 0 also works but is the snapshot store, so move that elsewhere first.
 3. Expected log lines: `"Beginning to load resources from /cards/sd0/Garmin/resources"` (or `/mnt/cards/sd0/...`), `"Successfully processed b2c file: ..."`, `"New resources found from %s? Yes"`, then per-handle `"Loading image on demand (%s)."`.
 
 Caveat: this needs the firmware's SD-card detection and FAT driver to work in the emulator (task `HWM UFS SD Detection`, mount at `/mnt/cards/sd0`); that path has not been exercised yet. If `0x80f3e440` never runs, a breakpoint on `0x800ecabc` with `r0` = path string tells whether any package load is attempted.
