@@ -3,15 +3,15 @@
 # the first Data/Prefetch abort or Undefined exception.
 #   tools/exec_trace.sh <seconds> [extra qemu args...]
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$(dirname "$0")/lib.sh"
 SECS="${1:-4}"; shift || true
-LOGDIR="${LOGDIR:-/var/tmp/gpsmap}"; mkdir -p "$LOGDIR"
-pkill -x qemu-system-arm 2>/dev/null; sleep 0.3
+LOGDIR="$(logdir)"; mkdir -p "$LOGDIR"
+kill_qemu; nap 0.3
 rm -f "$LOGDIR/gpsmap_qemu.log" "$LOGDIR/gpsmap_serial.txt"
 "$HERE/tools/run_gpsmap.sh" -display none -smp 1 -d exec,nochain,int,unimp,guest_errors "$@" >"$LOGDIR/gpsmap_run.out" 2>&1 &
 QPID=$!
 sleep "$SECS"
-kill $QPID 2>/dev/null; sleep 0.3
+kill $QPID 2>/dev/null; nap 0.3
 LOG="$LOGDIR/gpsmap_qemu.log"
 echo "=== run.out"; head -5 "$LOGDIR/gpsmap_run.out"
 echo "=== log lines: $(wc -l <"$LOG")"

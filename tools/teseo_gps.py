@@ -51,7 +51,10 @@ gps_st_config.c:338 "Watchdog expired" callback (0x80131a4c, OS-table slot
 +0x60 installed at 0x800c59c8) asserts and reboots.  The stand-in therefore
 answers 0x1026 with 1 once per second.
 
-    teseo_gps.py <socket path> [log file]
+    teseo_gps.py <endpoint> [log file]
+
+The endpoint is the UART1 chardev QEMU serves: a unix socket path on
+Linux/WSL, tcp:host:port on Windows (tools/run_gpsmap.py picks it).
 """
 import os
 import select
@@ -59,6 +62,9 @@ import socket
 import struct
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qenv                                                    # noqa: E402
 
 BOOTLOADER_MIN = 28 + 0x134
 IDLE_S = 0.15
@@ -269,13 +275,17 @@ class Rcif:
 
 def main():
     path = sys.argv[1]
-    logf = open(sys.argv[2] if len(sys.argv) > 2 else "/dev/stderr", "a")
-    for _ in range(100):
-        if os.path.exists(path):
+    logf = (open(sys.argv[2], "a") if len(sys.argv) > 2 else sys.stderr)
+    # QEMU is the server on this endpoint and may still be starting up.
+    for _ in range(300):
+        try:
+            s = qenv.connect(path, timeout=IDLE_S)
             break
-        time.sleep(0.1)
-    s = socket.socket(socket.AF_UNIX)
-    s.connect(path)
+        except (OSError, SystemExit):
+            time.sleep(0.1)
+    else:
+        log(logf, f"gave up connecting to {path}")
+        return
     s.settimeout(IDLE_S)
     log(logf, f"connected to {path}")
 

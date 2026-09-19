@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Send HMP monitor commands to a running QEMU over its unix socket.
+"""Send HMP monitor commands to a running QEMU over its monitor socket.
 
-    qmon.py [--sock /tmp/gpsmap_mon.sock] "info registers -a" "x/8i $pc" ...
+    qmon.py [--sock ENDPOINT] "info registers -a" "x/8i $pc" ...
+
+ENDPOINT is a unix socket path or tcp:host:port; the default is the monitor
+of the session in $LOGDIR (see tools/qenv.py), which works on both hosts.
 """
 import argparse
+import os
 import socket
+import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qenv                                                    # noqa: E402
+
 ap = argparse.ArgumentParser()
-ap.add_argument("--sock", default="/tmp/gpsmap_mon.sock")
+ap.add_argument("--sock", default=qenv.sock_path("monitor"))
 ap.add_argument("--wait", type=float, default=1.0)
 ap.add_argument("cmds", nargs="+")
 a = ap.parse_args()
 
-s = socket.socket(socket.AF_UNIX)
-s.connect(a.sock)
+s = qenv.connect(a.sock)
 s.settimeout(a.wait)
 
 
@@ -26,7 +33,7 @@ def drain():
             if not chunk:
                 break
             out += chunk
-        except socket.timeout:
+        except (socket.timeout, TimeoutError):
             break
     return out.decode(errors="replace")
 

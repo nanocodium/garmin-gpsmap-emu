@@ -3,14 +3,14 @@
 # 0xa15652a8) and the current task, via the monitor.
 #   MAIN=1 tools/syc_state.sh <seconds>
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$(dirname "$0")/lib.sh"
 SECS="${1:-60}"
-LOGDIR="${LOGDIR:-/var/tmp/gpsmap/syc}"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
-pkill -x qemu-system-arm 2>/dev/null; sleep 0.3
+LOGDIR="$(logdir syc)"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
+kill_qemu; nap 0.3
 LOGDIR="$LOGDIR" "$HERE/tools/run_gpsmap.sh" -display none -smp 1 >"$LOGDIR/run.out" 2>&1 &
 QPID=$!
 sleep "$SECS"
-Q="python3 $HERE/tools/qmon.py --sock $LOGDIR/gpsmap_mon.sock"
+Q="$PY $HERE/tools/qmon.py --sock $LOGDIR/gpsmap_mon.sock"
 $Q stop >/dev/null 2>&1
 P=$($Q "xp/1xw 0xa15652a8" 2>/dev/null | sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -oE ': 0x[0-9a-f]+' | head -1 | cut -c3-)
 echo "SYC main TCB = $P"

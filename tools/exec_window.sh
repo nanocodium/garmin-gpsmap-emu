@@ -3,20 +3,20 @@
 # print the blocks executed right before the first Data/Prefetch abort in it.
 #   MAIN=1 tools/exec_window.sh <start-delay-s> <window-s> [extra qemu args]
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$(dirname "$0")/lib.sh"
 DELAY="${1:-6}"; WIN="${2:-15}"; shift 2 || shift $#
-LOGDIR="${LOGDIR:-/var/tmp/gpsmap/xw}"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
-pkill -x qemu-system-arm 2>/dev/null; sleep 0.3
+LOGDIR="$(logdir xw)"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
+kill_qemu; nap 0.3
 LOGDIR="$LOGDIR" "$HERE/tools/run_gpsmap.sh" -display none -smp 1 -d int "$@" >"$LOGDIR/run.out" 2>&1 &
 QPID=$!
 sleep "$DELAY"
-python3 "$HERE/tools/qmon.py" --sock "$LOGDIR/gpsmap_mon.sock" "log int,exec,nochain" >/dev/null 2>&1
+$PY "$HERE/tools/qmon.py" --sock "$LOGDIR/gpsmap_mon.sock" "log int,exec,nochain" >/dev/null 2>&1
 sleep "$WIN"
-python3 "$HERE/tools/qmon.py" --sock "$LOGDIR/gpsmap_mon.sock" "log int" >/dev/null 2>&1
-kill $QPID 2>/dev/null; sleep 0.3
+$PY "$HERE/tools/qmon.py" --sock "$LOGDIR/gpsmap_mon.sock" "log int" >/dev/null 2>&1
+kill $QPID 2>/dev/null; nap 0.3
 LOG="$LOGDIR/gpsmap_qemu.log"
 echo "log lines: $(wc -l <"$LOG")"
-python3 - "$LOG" <<'EOF'
+$PY - "$LOG" <<'EOF'
 import re,sys
 log=sys.argv[1]
 pcs=[]; found=False

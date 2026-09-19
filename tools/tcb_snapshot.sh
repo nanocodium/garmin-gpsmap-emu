@@ -3,24 +3,24 @@
 # task control block (magic 0x0ED1A247 at +0x24) with name/state/prio/wait.
 #   [MAIN=1] tools/tcb_snapshot.sh <seconds>
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$(dirname "$0")/lib.sh"
 SECS="${1:-60}"
-LOGDIR="${LOGDIR:-/var/tmp/gpsmap/tcbs}"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
-pkill -x qemu-system-arm 2>/dev/null; sleep 0.3
+LOGDIR="$(logdir tcbs)"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
+kill_qemu; nap 0.3
 cd "$LOGDIR"
 LOGDIR="$LOGDIR" "$HERE/tools/run_gpsmap.sh" -display none -smp 1 >"$LOGDIR/run.out" 2>&1 &
 QPID=$!
 sleep "$SECS"
-python3 "$HERE/tools/qmon.py" --sock "$LOGDIR/gpsmap_mon.sock" "stop" \
+$PY "$HERE/tools/qmon.py" --sock "$LOGDIR/gpsmap_mon.sock" "stop" \
   "pmemsave 0xa1f00000 0x600000 ramA.bin" "pmemsave 0x82e00000 0x400000 ramB.bin" \
   "pmemsave 0xa4900000 0x300000 ramC.bin" "pmemsave 0x9fb00000 0x300000 ramD.bin" \
   "pmemsave 0xa5c00000 0x200000 ramE.bin" "pmemsave 0xa2500000 0x800000 ramF.bin" \
   "pmemsave 0xa4000000 0x900000 ramG.bin" "pmemsave 0xf7f00000 0x100000 ramH.bin" \
   "pmemsave 0x8d600000 0x100000 ramI.bin" "info registers" 2>/dev/null \
   | sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -E "R1[2-5]|PSR"
-sleep 1
+nap 1
 kill $QPID 2>/dev/null
-python3 - <<'EOF'
+$PY - <<'EOF'
 import struct
 MAGIC = 0x0ED1A247
 bases = {"ramA.bin": 0xa1f00000, "ramB.bin": 0x82e00000, "ramC.bin": 0xa4900000,

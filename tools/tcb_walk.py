@@ -8,10 +8,15 @@ TCB layout: +0 link, +4 prio, +0xa state, +0x1c saved SP, +0x24 magic
 0xA4AACAB8.  With --chain the saved stack is scanned for return addresses.
 """
 import argparse
+import os
 import re
 import socket
 import struct
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qenv                                                    # noqa: E402
 
 MAGIC = 0x0ED1A247
 CUR = 0xA4AACAB8
@@ -20,8 +25,7 @@ ESC = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 class Mon:
     def __init__(self, path):
-        self.s = socket.socket(socket.AF_UNIX)
-        self.s.connect(path)
+        self.s = qenv.connect(path)
         self.s.settimeout(0.3)
         self.drain()
 
@@ -33,7 +37,7 @@ class Mon:
                 if not c:
                     break
                 out += c
-            except socket.timeout:
+            except (socket.timeout, TimeoutError):
                 break
         return ESC.sub("", out.decode(errors="replace"))
 
@@ -58,7 +62,8 @@ class Mon:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sock", default="/var/tmp/gpsmap/live/gpsmap_mon.sock")
+    ap.add_argument("--sock",
+                    default=qenv.sock_path("monitor", qenv.logdir("live")))
     ap.add_argument("--filter", default=".")
     ap.add_argument("--chain", action="store_true")
     ap.add_argument("--max", type=int, default=200)

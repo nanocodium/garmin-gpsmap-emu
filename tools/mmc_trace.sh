@@ -3,15 +3,15 @@
 # controller traffic that follows the last eMMC CSD read.
 #   tools/mmc_trace.sh <seconds>
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$(dirname "$0")/lib.sh"
 SECS="${1:-35}"
-LOGDIR="${LOGDIR:-/var/tmp/gpsmap/mmc}"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
-pkill -x qemu-system-arm 2>/dev/null; sleep 0.3
+LOGDIR="$(logdir mmc)"; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
+kill_qemu; nap 0.3
 LOGDIR="$LOGDIR" "$HERE/tools/run_gpsmap.sh" -display none \
   -trace 'sdcard_*' -trace 'sdhci_*' >"$LOGDIR/run.out" 2>&1 &
 QPID=$!
 sleep "$SECS"
-kill $QPID 2>/dev/null; sleep 0.3
+kill $QPID 2>/dev/null; nap 0.3
 LOG="$LOGDIR/gpsmap_qemu.log"
 echo "log lines: $(wc -l <"$LOG")"
 N=$(grep -n 'SEND_CSD' "$LOG" | tail -1 | cut -d: -f1)
