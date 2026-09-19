@@ -9,6 +9,7 @@ ram*.bin
 # scratch and generated output
 scratch/
 out/*.ppm
+out/watch/
 out/*.bin
 __pycache__/
 *.pyc
