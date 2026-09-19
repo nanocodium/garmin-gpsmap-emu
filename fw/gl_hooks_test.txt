@@ -1,0 +1,2 @@
+# test hook: user-mode SGXKickTA (returns PVRSRV_OK without kicking)
+SGXKickTA 8034114e 4

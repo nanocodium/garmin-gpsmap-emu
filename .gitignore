@@ -1,0 +1,14 @@
+# Garmin firmware and update-card contents (copyrighted, multi-GB): not redistributed.
+*.zip
+fw/*.bin
+fw/*.img
+fw/*.qcow2
+fw/*.xml
+dat/
+ram*.bin
+# scratch and generated output
+scratch/
+out/*.ppm
+out/*.bin
+__pycache__/
+*.pyc

@@ -1,0 +1,13 @@
+
+config GARMIN_GPSMAP
+    bool
+    default y
+    depends on TCG && ARM
+    select A9MPCORE
+    select PL310
+    select SERIAL_MM
+    select SDHCI
+    select LAN9118
+    select UNIMP
+    select I2C
+    select OR_IRQ
