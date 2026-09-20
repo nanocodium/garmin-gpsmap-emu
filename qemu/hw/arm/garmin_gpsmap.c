@@ -290,6 +290,27 @@ static const TypeInfo regstub_info = {
     .class_init = regstub_class_init,
 };
 
+/*
+ * OMAP4 secondary bring-up: CPU0 publishes the entry point in
+ * AUX_CORE_BOOT_1 and a non-zero flag in AUX_CORE_BOOT_0.  The parked core
+ * waits in WFI, which only an interrupt would end, so take it out of halt
+ * here instead.
+ */
+static void wkupgen_write_hook(GarminRegStub *s, hwaddr addr, uint64_t val)
+{
+    CPUState *cs;
+
+    if (addr != OMAP4_WKUPGEN_AUX_BOOT0 || !val) {
+        return;
+    }
+    CPU_FOREACH(cs) {
+        if (cs->cpu_index != 0 && cs->halted) {
+            cs->halted = 0;
+            cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
+        }
+    }
+}
+
 static GarminRegStub *make_stub(const char *name, hwaddr base, uint32_t size,
                                 uint32_t rdclear)
 {
@@ -3802,8 +3823,14 @@ static const TypeInfo dispc_info = {
 /*  0x0c.. b  .                                                           */
 /*  0x20  smc_handler: mov r0,#0 ; movs pc,lr                             */
 /*  0x40  park: ldr r1,=WKUPGEN_AUX_CORE_BOOT_0                           */
-/*        loop: ldr r0,[r1]; cmp r0,#0; bne go; wfe; b loop               */
+/*        loop: ldr r0,[r1]; cmp r0,#0; bne go; wfi; b loop               */
 /*        go:   ldr pc,[r1,#4]                                            */
+/*                                                                        */
+/* WFI, not the WFE the protocol would use: QEMU implements WFE as a       */
+/* yield, so the parked core spun at full speed on that MMIO read - one    */
+/* host core, and the BQL taken on every read, which throttles CPU0.       */
+/* WFI really halts; wkupgen_write_hook() below releases the core when     */
+/* AUX_CORE_BOOT_0 is written, which is what the bring-up protocol does.   */
 /* ------------------------------------------------------------------ */
 
 #define ARM_B(from, to)  (0xea000000u | ((((int32_t)(to) - (int32_t)(from) - 8) >> 2) & 0x00ffffffu))
@@ -3882,7 +3909,7 @@ static void build_boot_rom(uint32_t *rom, uint32_t entry)
     rom[0x144 / 4] = 0xe5910000;                /* loop: ldr r0, [r1] */
     rom[0x148 / 4] = 0xe3500000;                /* cmp r0, #0 */
     rom[0x14c / 4] = ARM_BNE(0x14c, 0x158);     /* bne go */
-    rom[0x150 / 4] = 0xe320f002;                /* wfe */
+    rom[0x150 / 4] = 0xe320f003;                /* wfi */
     rom[0x154 / 4] = ARM_B(0x154, 0x144);       /* b loop */
     rom[0x158 / 4] = 0xe591f004;                /* go: ldr pc, [r1, #4] */
     rom[0x15c / 4] = OMAP4_WKUPGEN_BASE + OMAP4_WKUPGEN_AUX_BOOT0;
@@ -4105,6 +4132,7 @@ static void gpsmap_init(MachineState *machine)
     make_stub("omap4.ctrl_wkup_pad", 0x4a31e000, 0x1000, 0);
     st = make_stub("omap4.wkupgen", OMAP4_WKUPGEN_BASE, 0x1000, 0);
     st->quiet = true;
+    st->write_hook = wkupgen_write_hook;
 
     st = make_stub("omap4.trng", 0x48090000, 0x2000, 0);
     st->read_fixup = trng_read_fixup;
@@ -4458,7 +4486,12 @@ static void gpsmap_class_init(ObjectClass *oc, const void *data)
     mc->reset = gpsmap_machine_reset;
     mc->max_cpus = 2;
     mc->min_cpus = 1;
-    mc->default_cpus = 2;
+    /*
+     * The firmware runs its RTOS entirely on CPU0 and leaves the second core
+     * parked for the whole session, so modelling it by default only costs a
+     * host core.  Ask for both with -smp 2.
+     */
+    mc->default_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a9");
     mc->default_ram_size = 1 * GiB;   /* loader relocates itself to 0xA0000000 */
     mc->default_ram_id = "gpsmap.ram";

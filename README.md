@@ -13,6 +13,10 @@ resource package on an emulated SD card. The **loader image** boots,
 initialises the eMMC and validates the main region. Touch works: tapping
 "I Agree" opens the home screen (`tools/live.sh` gives a clickable window).
 
+Hosts: Linux/WSL and **native Windows** (`docs/windows.md`) — same machine,
+same tools; the host-specific parts are the renderer's GL context and the
+monitor/QMP transport.
+
 ## Layout
 
 | Path | Purpose |
@@ -25,25 +29,38 @@ initialises the eMMC and validates the main region. Touch works: tapping
 | `fw/mnand.img` | synthetic 1 GiB eMMC image with the main region installed |
 | `qemu/hw/arm/garmin_gpsmap.c` | the QEMU machine and all OMAP4 device models |
 | `qemu/hw/arm/Kconfig.garmin` | Kconfig fragment for the machine |
-| `tools/` | decryption, image builders, run and debug scripts |
+| `tools/` | decryption, image builders, run and debug scripts (Python core + shell wrappers) |
+| `tools/win/` | PowerShell entry points for a native Windows host (`docs/windows.md`) |
 
 ## Building
 
-Tested with QEMU v10.2.1 on WSL Ubuntu (gcc, ninja, glib, pixman, SDL2/GTK dev packages).
+Runs on **Linux/WSL and natively on Windows**; tested with QEMU v10.2.1 on WSL
+Ubuntu and on Windows 11 with MSYS2 MINGW64. See `docs/windows.md` for the
+Windows details (WGL rendering, TCP monitor sockets, no mtools needed).
 
 ```bash
-tools/install_qemu_machine.sh ~/qemu-garmin
+tools/install_qemu_machine.sh ~/qemu-garmin        # Linux / WSL
+```
+```powershell
+tools\win\install_qemu_machine.ps1                 # Windows (MSYS2/MinGW)
 ```
 
-This clones QEMU if needed, copies `garmin_gpsmap.c` into `hw/arm/`, appends the
-Kconfig fragment, adds the meson entry, configures `arm-softmmu` and builds.
+Either script clones QEMU if needed, runs `tools/patch_qemu_tree.py` (copies
+`garmin_gpsmap.c`/`garmin_gl.c` into `hw/arm/`, appends the Kconfig fragment,
+adds the meson entry), then configures `arm-softmmu` and builds. `--enable-opengl`
+(libepoxy) is required for the renderer.
 
 ## Preparing the firmware images
 
 ```bash
-python tools/gdec_fast.py 95.dat 115.dat          # decrypt loader / main from the zip
-python tools/mkbootcfg.py fw/bootcfg_cs0.bin      # boot-config TLV (7x08, touch)
-python tools/mkemmc.py fw/mnand.img --main fw/gpsmap7x08_main_0x80050000.bin
+python3 tools/gdec_fast.py --zip GPSMAPSerieswithSDCard_202608031.zip 95.dat 115.dat
+python3 tools/mkbootcfg.py fw/bootcfg_cs0.bin      # boot-config TLV (7x08, touch)
+python3 tools/mkemmc.py fw/mnand.img --main fw/gpsmap7x08_main_0x80050000.bin
+python3 tools/mkdrives.py                          # the five qcow2 drives
+python3 tools/mk_resource_sd.py                    # GUI resource card (optional)
+```
+```powershell
+tools\win\setup_images.ps1                         # all of the above, in order
 ```
 
 Update-card `.dat` files (`encoding 2`) are byte-wise ADD-obfuscated with
@@ -56,11 +73,20 @@ MAIN=1 tools/run_gpsmap.sh                 # boot the main image (GUI/app firmwa
 tools/run_gpsmap.sh                        # boot the loader/updater image
 MAIN=1 tools/run_gpsmap.sh -machine stub-log=on -d int,unimp,guest_errors
 ```
+```powershell
+tools\win\run_gpsmap.ps1 -Main
+tools\win\run_gpsmap.ps1 -Main -Display none -- -machine stub-log=on -d int,unimp
+```
+
+Both are wrappers around `tools/run_gpsmap.py`, which owns the command line and
+the same environment interface (`QEMU FW LOGDIR MAIN NOGPS SNAP QLOG GLHOOKS SD0`).
 
 Machine options: `bootcfg=<file>` (GPMC CS0 image), `stub-log=on|off` (log every
 access to stubbed register blocks), `entry=<addr>` (reset PC). Logs go to
-`$LOGDIR` (default `/var/tmp/gpsmap`): `gpsmap_qemu.log`, `gpsmap_serial.txt`,
-monitor socket `gpsmap_mon.sock`.
+`$LOGDIR` (default `/var/tmp/gpsmap`, `%TEMP%\gpsmap` on Windows):
+`gpsmap_qemu.log`, `gpsmap_serial.txt`, and the monitor/QMP/GPS endpoints
+(unix sockets on Linux, TCP loopback plus a redirect file on Windows, so
+`--sock $LOGDIR/gpsmap_mon.sock` works on both).
 
 ## Fast iteration: VM snapshots
 
@@ -80,9 +106,15 @@ Rebuild the snapshot after changing device models.
 
 | Script | What it does |
 |---|---|
-| `tools/qmon.py` | send HMP monitor commands over the unix socket |
-| `tools/tap.py X Y` | absolute touch at panel pixels through the QMP socket (`$LOGDIR/qmp.sock`) |
-| `tools/live.sh` / `tools/live_view.py` | long-running GTK window session (WSLg) + browser live view at http://localhost:8765 |
+| `tools/qmon.py` | send HMP monitor commands to the monitor endpoint |
+| `tools/tap.py X Y` | absolute touch at panel pixels through the QMP endpoint (`$LOGDIR/qmp.sock`) |
+| `tools/live.sh` / `tools/live.py` / `tools/live_view.py` | long-running window session (GTK under WSLg, SDL on Windows) + browser live view at http://localhost:8765 |
+| `tools/qenv.py` | shared host glue: log directory, socket endpoints, process control |
+| `tools/mkfatimg.py` | FAT32 card images without mtools or root |
+| `tools/bootbench.py` | time a cold boot to the Nth presented frame (fixed workload) |
+| `tools/boottimeline.py` | where the boot's wall time goes, and what it waits on |
+| `tools/guestprof.py` | sampling profiler through the monitor (PC histogram) |
+| `tools/watch_screen.py` | save a PNG each time the panel changes |
 | `tools/gdbrsp.py` | minimal GDB remote client: breakpoints, write watchpoints, hit tracing with task names |
 | `tools/break_dump.sh` | boot with gdbstub, break at an address, dump registers/stack/memory |
 | `tools/tcb_snapshot.sh` | list all RTOS task control blocks (name, priority, state, wait object) |
@@ -117,6 +149,35 @@ stubs, DSS/DISPC/HDMI/SGX register stubs.
   inputs; a wrong type selects no display and the firmware divides by zero.
 - Fatal errors are reported through `0x8006ea8c` with `{code, pc, args}`; the
   runtime trap code `0x6e5d800c` with args `2,2` is a divide by zero.
+- QEMU implements `WFE` as a yield, not a halt, so the secondary core's park
+  loop (`ldr`/`cmp`/`wfe`) spun at full speed on an MMIO read: a whole host
+  core, and the BQL taken on every read, which serialises CPU0. The loop
+  parks in `WFI` instead, released by the AUX_CORE_BOOT_0 write that the
+  bring-up protocol performs, and the machine defaults to one CPU because the
+  firmware leaves the second parked for the whole session. Emulator CPU use
+  halved (211% -> 106% of a core).
+- Boot to the warning screen is gated by the firmware's own waits, not by
+  emulation speed: four machines booting at once each reach it in the same
+  wall time as one alone. Nothing that makes execution faster shortens it -
+  `tb-size` is irrelevant (`info jit` reports zero TB flushes), `-icount` is
+  1.6x slower or worse, and the display and per-frame PPM dumps together cost
+  about 2%. `tools/boottimeline.py` shows where the time goes; roughly 75% of
+  it sits in four waits that follow an eMMC CMD15/CMD52 rejection, the
+  LAN9221 register writes, the touch firmware-update attempt and a DISPC
+  read. Use a snapshot rather than booting.
+- A FAT long name is stored 13 UTF-16 characters per directory entry and the
+  NUL terminator is only written when the name leaves room for it. The
+  firmware counts `ceil(len/13)` entries, so a name whose length is an exact
+  multiple of 13 plus a superfluous terminator entry cannot be found at all -
+  206 of the resource package's 2939 bitmaps, including the page header and
+  several home-screen icons, which then render as the red/white placeholder.
+  7-Zip, Linux and Windows all read such a card happily, so verifying by
+  extraction proves nothing; `tools/mkfatimg.py` now checks its own output
+  the strict way (`docs/gui_resources.md`).
+- Re-reading a texture's guest buffer at swap time because its bytes changed
+  is not safe across frames: after the GUI rebuilds its windows the buffer
+  has been freed and reused, and the layer fills with noise. Only the
+  textures uploaded in the current frame may be re-read (`GARMIN_GL_RESYNC`).
 - I2C completion must be delayed (~100 us) and set the bus-free bit, otherwise the
   completion interrupt is lost and every transaction times out.
 
@@ -204,11 +265,16 @@ GL/EGL entry points:
   the frame is kicked, and the firmware relies on it (the compositor draws
   its software-rendered 1024x1024 layer into the texture after the GL calls
   that reference it). State and draw calls are therefore queued per frame and
-  replayed at `eglSwapBuffers`, when large client textures are re-read from
-  guest memory (queued uploads get fresh texels, earlier ones are re-hashed
-  and re-uploaded if the firmware drew into them). Queries flush the queue.
-  Small glyph/icon textures are copied at call time like the driver does
-  (the firmware reuses their staging buffer immediately).
+  replayed at `eglSwapBuffers`, when the textures *this frame* uploaded are
+  re-read from guest memory so they get the texels the GPU would have seen.
+  Queries flush the queue. Small glyph/icon textures are copied at call time
+  like the driver does (the firmware reuses their staging buffer immediately).
+  Re-reading the buffers of textures uploaded in *earlier* frames is a guess
+  about memory the firmware owns and is off by default (`GARMIN_GL_RESYNC=1`):
+  after the GUI tears its windows down and rebuilds them - switching the unit
+  into Store Demonstration does that - those buffers have been freed and
+  reused, so the re-upload puts unrelated memory into the layer and the page
+  background fills with bands of noise.
 - `patch <addr> <hexbytes>` lines in the hook table apply raw code patches
   with the trampolines. Two are used (`docs/resource_redraw.md`): the eager
   bitmap importer task returns immediately, and the SD card-detect debounce
@@ -216,12 +282,20 @@ GL/EGL entry points:
   desktop exists; otherwise the GUI tears down and re-creates every window
   while loading 2939 bitmaps synchronously from the slow emulated card and is
   unresponsive for minutes.
-- Logging: `GARMIN_GL_LOG=1` logs every GL call (slow); default off. QEMU
-  `-d` categories come from `QLOG` (default `guest_errors`).
+- Logging: `GARMIN_GL_LOG=1` logs every GL call (slow); default off.
+  `GARMIN_GL_DRAWTEX=1` is the cheap subset: `glDrawTexOES` blits with their
+  crop rectangle and texture size, crop-rectangle changes, and swap-time
+  layer re-uploads. `GARMIN_GL_FBO=1` enables the GL_OES_framebuffer_object
+  and EGL surface entry points, which are implemented but off because the GUI
+  does not need them and they make the page header worse. QEMU `-d`
+  categories come from `QLOG` (default `guest_errors`).
 
-Live view: `tools/live.sh` (WSL) starts a hooked session plus
-`tools/live_view.py`, a page at http://localhost:8765 that shows a QEMU
+Live view: `tools/live.sh` (or `tools\win\live.ps1`) starts a hooked session
+plus `tools/live_view.py`, a page at http://localhost:8765 that shows a QEMU
 screendump (DISPC output) and the renderer's last frame, refreshed every second.
+
+The renderer's context is the only host-specific part: surfaceless EGL on
+Linux, a hidden-window WGL compatibility context on Windows (`docs/windows.md`).
 
 ## Open items
 
@@ -231,9 +305,10 @@ screendump (DISPC output) and the renderer's last frame, refreshed every second.
   installs to `/data/resources/wsvga` on its proprietary UFS volume. Without
   them every image handle resolves to the built-in 32x32 red/white "missing
   image" (`docs/gui_resources.md`). The firmware also loads packages from a
-  card at `Garmin/resources`, so `tools/mk_resource_sd.sh` builds
+  card at `Garmin/resources`, so `tools/mk_resource_sd.py` builds
   `fw/sd_resources.qcow2` (FAT32 superfloppy, 256 MiB: QEMU wants power-of-two
-  SD sizes) which the run script attaches to HSMMC4 = slot `sd0`
+  SD sizes; written by `tools/mkfatimg.py`, so no mtools and no root) which the
+  run script attaches to HSMMC4 = slot `sd0`
   (`/mnt/cards/sd0`). Card presence is a level-polled HAL GPIO: signal 0x27 =
   GPIO4.17 for sd0, 0x26 = GPIO4.16 for sd1 (HSMMC1), active low
   (`docs/sd_card.md`); the machine drives GPIO4.17 low.

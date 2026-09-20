@@ -5,7 +5,7 @@ Polls the QEMU monitor for a screendump (DISPC output) and, if present, the
 host renderer's last frame (GARMIN_GL_DUMP ppm), and serves both as PNG on an
 auto-refreshing page.
 
-    python3 tools/live_view.py --logdir /var/tmp/gpsmap/live --port 8765
+    python3 tools/live_view.py --logdir <session logdir> --port 8765
 
 Open http://localhost:8765 (WSL forwards localhost to Windows).
 """
@@ -13,9 +13,13 @@ import argparse
 import io
 import os
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qenv                                                    # noqa: E402
 
 from PIL import Image
 
@@ -44,15 +48,13 @@ setInterval(tick,iv);tick();
 
 
 def monitor(sock_path, cmd, timeout=2.0):
-    """Send one HMP command over the unix monitor socket."""
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    """Send one HMP command over the monitor endpoint."""
+    s = qenv.connect(sock_path, timeout=timeout)
     try:
-        s.connect(sock_path)
         time.sleep(0.05)
         try:
             s.recv(4096)
-        except socket.timeout:
+        except (socket.timeout, TimeoutError):
             pass
         s.sendall((cmd + "\n").encode())
         out = b""
@@ -60,7 +62,7 @@ def monitor(sock_path, cmd, timeout=2.0):
         while time.time() < deadline:
             try:
                 chunk = s.recv(4096)
-            except socket.timeout:
+            except (socket.timeout, TimeoutError):
                 break
             if not chunk:
                 break
@@ -81,7 +83,7 @@ class State:
         self.lock = threading.Lock()
 
     def loop(self):
-        sock = os.path.join(self.logdir, "gpsmap_mon.sock")
+        sock = qenv.sock_path("monitor", self.logdir)
         ppm = os.path.join(self.logdir, "live_screen.ppm")
         frame_ppm = os.environ.get("GARMIN_GL_DUMP", os.path.join(self.logdir, "frame.ppm"))
         while True:
@@ -90,7 +92,7 @@ class State:
                 try:
                     monitor(sock, "screendump %s" % ppm)
                     self._load("screen", ppm)
-                except (OSError, socket.timeout):
+                except (OSError, socket.timeout, TimeoutError, SystemExit):
                     pass
             self._load("frame", frame_ppm)
             time.sleep(max(0.1, self.interval - (time.time() - t0)))
@@ -123,7 +125,7 @@ class State:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--logdir", default="/var/tmp/gpsmap")
+    ap.add_argument("--logdir", default=str(qenv.logdir()))
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--interval", type=float, default=1.0)
     args = ap.parse_args()
